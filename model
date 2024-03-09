@@ -1,0 +1,532 @@
+#############################
+### Import data from FRED ###
+#############################
+
+# FRED import data
+install.packages("quantmod")
+library(quantmod)
+
+getSymbols("UNRATE", src = "FRED") # unemployment rate from FRED
+getSymbols("CPIAUCSL", src = "FRED") # inflation rate from FRED
+getSymbols("FEDFUNDS", src = "FRED") # Federal Funds Rate
+getSymbols("GDPC1", src = "FRED") # Real Gross Domestic Product
+
+# Convert them to data frames
+unempr <- data.frame(date = index(UNRATE), UNRATE = coredata(UNRATE))
+cpi <- data.frame(date = index(CPIAUCSL), CPIAUCSL = coredata(CPIAUCSL))
+fedr <- data.frame(date = index(FEDFUNDS), FEDFUNDS = coredata(FEDFUNDS))
+gdpr <- data.frame(date = index(GDPC1), GDPC1 = coredata(GDPC1))
+
+rm(UNRATE, CPIAUCSL, FEDFUNDS, GDPC1)
+
+#############################################
+### Data Transformation And Interpolation ###
+#############################################
+
+# Data transformations
+install.packages("dplyr")
+install.packages("lubridate")
+library(dplyr)
+library(lubridate)
+
+# Generate monthly time points
+quarter_dates_numeric <- as.numeric(gdpr$date)
+monthly_dates_numeric <- c()
+for (date in quarter_dates_numeric) {
+  monthly_dates_numeric <- c(monthly_dates_numeric, date, date + 30, date + 61) # Adding approximately one and two months
+}
+
+# Remove duplicates and sort
+monthly_dates_numeric <- sort(unique(monthly_dates_numeric))
+
+# Perform linear interpolation
+interpolated <- approx(x=quarter_dates_numeric, y=gdpr$GDPC1, xout=monthly_dates_numeric)
+
+# Convert back to date format and data frame
+interpolated_dates <- as.Date(interpolated$x, origin="1947-01-01")
+interpolated_df <- data.frame(
+  Date = interpolated_dates,
+  GDP = interpolated$y
+)
+
+# Add rows to match the other data frames
+new_rows <- matrix(NA, ncol = 2, nrow = 3)
+colnames(new_rows) <- colnames(interpolated_df)
+interpolated_df <- rbind(interpolated_df, as.data.frame(new_rows))
+rm(new_rows)
+
+# Add the GDP column to the CPI column
+cpi$gdprm <- interpolated_df$GDP
+
+# Generate the monthly inflation rate using CPI
+cpi <- cpi %>%
+  mutate(inflr = (CPIAUCSL / lag(CPIAUCSL, n = 1) - 1) * 100) # calculates the monthly inflation rate
+inflr <- cpi %>% select(date, inflr) # select the inflation rate
+
+# Generate the monthly real GDP growth rate
+cpi <- cpi %>%
+  mutate(gdprmg = (gdprm / lag(gdprm, n = 1) - 1) * 100) # calculates the monthly real GDP growth
+gdprmg <- cpi %>% select(date, gdprmg) # select the monthly real GDP growth
+
+# Add month and year columns from date
+inflrm <- inflr %>%
+  group_by(year = year(date), month = month(date)) %>%
+  slice(n()) %>%
+  ungroup()
+
+# Add columns months and years to each data frame
+unempr <- unempr %>%
+  mutate(year = year(date), month = month(date))
+inflrm <- inflrm %>%
+  mutate(year = year(date), month = month(date))
+gdprmg <- gdprmg %>%
+  mutate(year = year(date), month = month(date))
+fedr <- fedr %>%
+  mutate(year = year(date), month = month(date))
+
+# Combine data using month and year
+data <- full_join(unempr, inflrm, by = c("year", "month"))
+data <- full_join(data, gdprmg, by = c("year", "month"))
+data <- full_join(data, fedr, by = c("year", "month"))
+
+# Select needed columns 
+data2 <- data %>% select(date.x, UNRATE, inflr, gdprmg, FEDFUNDS)
+
+# Rename columns 
+data2 <- data2 %>% rename(date = date.x, unempr = UNRATE, fedr = FEDFUNDS)
+
+# Removing extra rows, cleaning NAs and transforming data
+data3 <- data2 %>% slice(-c(913:924)) # removing rows
+data3 <- na.omit(data3) %>% arrange(date()) # removing NAs
+sum(is.na(data3)) # test if there is any NA data
+data3$fedr2 <- data3$fedr + 1.8 # to remove all the negative values, the minimum at -1.7705
+data3$logfedr2 <- log(data3$fedr2)
+sum(is.na(data3$logfedr2))
+data3$logunempr <- log(data3$unempr)
+sum(is.na(data3$logunempr))
+head(data3)
+str(data3)
+
+#####################
+### Data Plotting ###
+#####################
+
+install.packages("ggplot2")
+install.packages("tidyr")
+library(ggplot2)
+library(tidyr)
+
+# Plotting Unemployment
+ggplot(data3, aes(x = date, y = unempr)) +
+  geom_line() +
+  labs(x = "Monthly", y = "Unemployment Rate", title = "U.S. Monthly Unemployment Rate") +
+  theme_minimal()
+
+# Plotting Unemployment and Inflation
+ggplot(data3, aes(x = date, y = value, color = variable)) +
+  geom_line(aes(y = unempr), color = "darkred") +
+  geom_line(aes(y = inflr), color = "blue") +
+  labs(title = "Unemployment and Inflation Rate", x = "Monthly", y = "Values")
+
+# Plotting the Philips Curve
+# 1 - With a linear regression line
+ggplot(data3, aes(x = unempr, y = inflr)) +
+  geom_point() +  # Add points
+  geom_smooth(method = "lm", se = FALSE) +  
+  labs(title = "Phillips Curve",
+       x = "Unemployment Rate",
+       y = "Inflation Rate") +
+  theme_minimal()
+# 2 - With a smooth line
+ggplot(data3, aes(x = unempr, y = inflr)) +
+  geom_point() +  # Add points
+  geom_smooth(method = "loess", se = FALSE) +  
+  labs(title = "Phillips Curve",
+       x = "Unemployment Rate",
+       y = "Inflation Rate") +  # Add labels
+  theme_minimal()  # Use a minimal theme
+
+# Plotting all data
+data4 <- data3 %>% select(date, unempr, inflr, gdprmg, fedr)
+cols <- c("#D43F3A", "#EEA236", "#5CB85C", "#46B8DA", "#")
+data4_long <- pivot_longer(data4, cols = -date, names_to = "Series", values_to = "Value")
+ggplot(data4_long, aes(x = date, y = Value, color = Series)) +
+  geom_line() +
+  labs(x = "Date in Months", y = "Values in Percent", title = "U.S. Monthly Unemployment, Inflation, GDP and Fed Interest Rate") +
+  scale_color_manual(values = cols)
+
+###############################################
+### Test for Autocorrelation Function (ACF) ###
+###############################################
+
+############
+# ACF Test #
+############
+
+# ACF Test for Data3
+acf(data3)
+
+# Unemployment rate ACF test
+acf_result_unempr <- acf(data3$unempr)
+print(acf_result_unempr)
+
+# Inflation rate ACF test
+acf_result_inflr <- acf(data3$inflr)
+print(acf_result_inflr)
+
+# Real GDP Growth rate ACF test
+acf_result_gdprmg <- acf(data3$gdprmg)
+print(acf_result_gdprmg)
+
+# Federal Funds rate ACF test
+acf_result_fedr <- acf(data3$fedr)
+print(acf_result_fedr)
+
+#############
+# PACF Test #
+#############
+
+# Unemployment rate PACF test
+pacf_result_unempr <- pacf(data3$unempr)
+print(pacf_result_unempr)
+# 1 lag
+
+# Inflation rate ACF test
+pacf_result_inflr <- pacf(data3$inflr)
+print(pacf_result_inflr)
+# 1 and 4 lag
+
+# Real GDP Growth rate ACF test
+pacf_result_gdprmg <- pacf(data3$gdprmg)
+print(pacf_result_gdprmg)
+# 1 and 4 lag
+
+# Federal Funds rate ACF test
+pacf_result_fedr <- pacf(data3$fedr)
+print(pacf_result_fedr)
+# 1 and 2 lag
+
+##########################################################################
+### Test for stationarity using the Augmented Dickey-Fuller (ADF) test ###
+##########################################################################
+
+install.packages("tseries")
+library(tseries)
+
+# Unemployment rate ADF results
+adf_res_unempr = adf.test(data3$unempr, k = 1, alternative = "stationary")
+print(adf_res_unempr)
+# Dickey-Fuller = -3.7301, Lag order = 1, p-value = 0.02249
+# alternative hypothesis: stationary
+
+# Inflation rate ADF results
+adf_res_inflr = adf.test(data3$inflr, k = 1, alternative = "stationary")
+print(adf_res_inflr)
+# Dickey-Fuller = -10.886, Lag order = 1, p-value = 0.01
+# alternative hypothesis: stationary
+
+# Real GDP Growth ADF results
+adf_res_gdprg = adf.test(data3$gdprmg, k = 1, alternative = "stationary")
+print(adf_res_gdprg)
+# Dickey-Fuller = -14.097, Lag order = 1, p-value = 0.01
+# alternative hypothesis: stationary
+
+# Federal Funds Rate ADF results
+adf_res_fedr = adf.test(data3$fedr, k = 1, alternative = "stationary")
+print(adf_res_fedr)
+# Dickey-Fuller = -3.2986, Lag order = 1, p-value = 0.07093
+# alternative hypothesis: stationary
+
+########################################
+### Model Implementation and Testing ###
+########################################
+
+install.packages("car")
+library(car)
+
+# Regression model
+model <- lm(inflr ~ unempr + gdprmg + fedr, data=data3)
+summary(model)
+plot(model)
+
+# Test for multicollinearity using the Variance Inflation Factor (VIF)
+vif_values <- vif(model)
+print(vif_values)
+# unempr   gdprmg     fedr 
+# 1.013671 1.016210 1.013082 
+# Low values of VIF showing low level of correlation between predictors in the model.
+
+# Residuals and fitted values
+residuals <- residuals(model)
+hist(residuals, breaks = 30)
+fitted_values <- fitted(model)
+hist(fitted_values, breaks = 30)
+plot(fitted_values, residuals, xlab = "Fitted Values", ylab = "Residuals", main = "Residuals vs Fitted")
+abline(h = 0, col = "red")
+
+# Testing for normality using Q-Q plot
+qqnorm(residuals)
+qqline(residuals, col = "red")
+
+############################################
+### Time Series Cross Validation Testing ###
+############################################
+
+# Creating train and test data
+trainData <- head(data3, -24)
+testData <- tail(data3, 24)
+str(trainData)
+str(testData)
+
+# Implementing the train data in the model
+model1 <- lm(inflr ~ unempr + gdprmg + fedr, data=trainData)
+summary(model1)
+plot(model1)
+
+# Predicting new data
+prediction1 <- predict(model1, newdata = testData)
+plot(prediction1)
+predicted_value_1p <- prediction1[1]
+print(predicted_value_1p)
+# One month ahead prediction using train data is 0.07983527
+
+# Extract residuals and fitted values
+residuals1 <- residuals(model1)
+hist(residuals1, breaks = 30)
+fitted_values1 <- fitted(model1)
+hist(fitted_values1, breaks = 30)
+plot(fitted_values1, residuals1, xlab = "Fitted Values", ylab = "Residuals", main = "Residuals vs Fitted")
+abline(h = 0, col = "red")
+
+# Model evaluation metrics
+mse <- mean((testData$inflr - prediction1)^2) # Mean Squared Error (MSE)
+rmse <- sqrt(mse) # The square root of MSE
+mae <- mean(abs(testData$inflr - prediction1)) # Mean Absolute Error (MAE)
+r_squared <- 1 - (sum((testData$inflr - prediction1)^2) / sum((testData$inflr - mean(testData$inflr))^2))
+
+# Print the metrics
+cat("MSE:", mse, "\nRMSE:", rmse, "\nMAE:", mae, "\nR-squared:", r_squared)
+
+############################################
+### Inflation at Risk Using Current Data ###
+############################################
+
+# Confidence level for both tails at 10%, or 5% on each side
+confidence_level <- 0.1
+
+# Calculate VaR for both tails
+lower_tail_VaR <- quantile(data3$inflr, confidence_level / 2)
+print(lower_tail_VaR) # -0.1028437
+upper_tail_VaR <- quantile(data3$inflr, 1 - confidence_level / 2)
+print(upper_tail_VaR) # 0.9238021
+
+# Calculate CVaR for both tails
+lower_tail_CVaR <- mean(data3$inflr[data3$inflr < lower_tail_VaR])
+print(lower_tail_CVaR) # -0.3222899
+upper_tail_CVaR <- mean(data3$inflr[data3$inflr > upper_tail_VaR])
+print(upper_tail_CVaR) # 1.090514
+
+######################################################
+### Inflation at Risk Using Monte Carlo Simulation ###
+######################################################
+
+# Linear model
+model <- lm(inflr ~ unempr + gdprmg + fedr, data=data3)
+summary(model)
+plot(model)
+
+# Coefficients and residuals
+model_coefficients <- coef(model)
+model_residuals <- residuals(model)
+
+# Set seed and number of simulations
+set.seed(1)
+n <- 1000
+simulated_inflr <- numeric(n)
+
+# Generating new simulated data
+simulated_unempr <- rnorm(n, mean = mean(data3$unempr), sd = sd(data3$unempr))
+simulated_gdprmg <- rnorm(n, mean = mean(data3$gdprmg), sd = sd(data3$gdprmg))
+simulated_fedr <- rnorm(n, mean = mean(data3$fedr), sd = sd(data3$fedr))
+
+# Performing Monte Carlo Simulations
+for (i in 1:n) {
+  random_residual <- sample(model_residuals, 1)
+  simulated_inflr[i] <- model_coefficients[1] + 
+    model_coefficients[2] * simulated_unempr[i] + 
+    model_coefficients[3] * simulated_gdprmg[i] + 
+    model_coefficients[4] * simulated_fedr[i] +
+    random_residual
+}
+
+# Monte Carlo Simulation Results
+hist(simulated_inflr, main = "Base Simulation of Inflation Rate", xlab = "Simulated Inflation Rate", breaks = 30)
+summary(simulated_inflr)
+#   Min.   1st Qu. Median   Mean   3rd Qu.  Max. 
+# -1.5318  0.0959  0.2824  0.2903  0.4720  1.5302 
+
+# Monte Carlo confidence level for both tails at 10%, or 5% on each side
+mc_confidence_level <- 0.1
+
+# Monte Carlo VaR for both tails
+mc_lower_tail_VaR <- quantile(simulated_inflr, mc_confidence_level / 2)
+print(mc_lower_tail_VaR) # -0.180144
+mc_upper_tail_VaR <- quantile(simulated_inflr, 1 - mc_confidence_level / 2)
+print(mc_upper_tail_VaR) # 0.7962237
+
+# Monte Carlo CVaR for both tails
+mc_lower_tail_CVaR <- mean(simulated_inflr[simulated_inflr < mc_lower_tail_VaR])
+print(mc_lower_tail_CVaR) # -0.3807376
+mc_upper_tail_CVaR <- mean(simulated_inflr[simulated_inflr > mc_upper_tail_VaR])
+print(mc_upper_tail_CVaR) # 0.9665727
+
+######################################################
+### Adverse Scenarios Using Monte Carlo Simulation ###
+######################################################
+
+# Linear model
+model <- lm(inflr ~ unempr + gdprmg + fedr, data=data3)
+
+# Coefficients and residuals
+model_coefficients <- coef(model)
+model_residuals <- residuals(model)
+
+# Set seed and number of simulations
+set.seed(1)
+n <- 1000
+stress_simulated_inflr <- numeric(n)
+
+# Actual Unemployment Rate mean, standard deviation and observations:
+unempr_mean <- mean(data3$unempr) # mean of unemployment rate
+unempr_sd <- sd(data3$unempr) # SD of unemployment rate
+print(paste("Mean:", unempr_mean))  # 5.86224366706876
+print(paste("Standard Deviation:", unempr_sd)) # 1.66587235665599
+
+# Stressed Values For Unemployment Rate
+stress_unempr_mean <- 10 # stressed mean of unemployment rate
+stress_unempr_sd <- 3 # stressed SD of unemployment rate
+
+# Generating new simulated data
+stress_simulated_unempr <- rnorm(n, mean = stress_unempr_mean, sd = stress_unempr_sd)
+simulated_gdprmg <- rnorm(n, mean = mean(data3$gdprmg), sd = sd(data3$gdprmg))
+simulated_fedr <- rnorm(n, mean = mean(data3$fedr), sd = sd(data3$fedr))
+
+# Performing Monte Carlo Simulations
+for (i in 1:n) {
+  random_residual <- sample(model_residuals, 1)
+  stress_simulated_inflr[i] <- model_coefficients[1] + 
+    model_coefficients[2] * stress_simulated_unempr[i] + 
+    model_coefficients[3] * simulated_gdprmg[i] + 
+    model_coefficients[4] * simulated_fedr[i] +
+    random_residual
+}
+
+# Stressed Monte Carlo Simulation Results
+hist(stress_simulated_inflr, main = "Adverse Simulation of Inflation Rate", xlab = "Simulated Inflation Rate", breaks = 30)
+summary(stress_simulated_inflr)
+#    Min.   1st Qu.  Median    Mean    3rd Qu.   Max. 
+# -1.56903  0.07136  0.25325  0.26180  0.44557  1.49544
+
+# Stressed Monte Carlo confidence level for both tails at 10%, or 5% on each side
+st_mc_confidence_level <- 0.1
+
+# Stressed Monte Carlo VaR for both tails
+st_mc_lower_tail_VaR <- quantile(stress_simulated_inflr, st_mc_confidence_level / 2)
+print(st_mc_lower_tail_VaR) # -0.199888
+st_mc_upper_tail_VaR <- quantile(stress_simulated_inflr, 1 - st_mc_confidence_level / 2)
+print(st_mc_upper_tail_VaR) # 0.7688719
+
+# Stressed Monte Carlo CVaR for both tails
+st_mc_lower_tail_CVaR <- mean(stress_simulated_inflr[stress_simulated_inflr < st_mc_lower_tail_VaR])
+print(st_mc_lower_tail_CVaR) # -0.4087233
+st_mc_upper_tail_CVaR <- mean(stress_simulated_inflr[stress_simulated_inflr > st_mc_upper_tail_VaR])
+print(st_mc_upper_tail_CVaR) # 0.9378932
+
+##################################################################
+### Plotting Simulated And Stressed Data Density Distributions ###
+##################################################################
+
+plot(density(simulated_inflr), main = "Density Comparison", xlab = "Values", ylab = "Density",
+     col = "blue", lwd = 2, ylim = c(0, 1.5))
+lines(density(stress_simulated_inflr), col = "red", lwd = 2)
+legend("topleft", legend = c("MC Simulated Inflation Rate", "Stressed MC Simulated Inflation Rate"), col = c("blue", "red"), lwd = 2, 
+       cex = 0.8, bty = "n")  # Adjust cex for size, bty for box type, etc.
+
+#################################
+### Testing Potential Model 2 ###
+#################################
+
+# Further model improvement and optimization are needed to make the results more reliable
+# a few changes to the model already resulted with unemployment rate becoming significant
+# this led me to further investigate another model. Unfortunately the model generated NAs.
+
+model2 <- lm(inflr ~ log(unempr) + log(fedr), data = data3) # the model generates NAs due to negative values in fedr data
+summary(model2)
+plot(model2)
+
+# Call:
+#   lm(formula = inflr ~ log(unempr) + log(fedr), data = data3)
+# 
+# Residuals:
+#   Min       1Q   Median       3Q      Max 
+# -1.94227 -0.18293 -0.03906  0.15801  1.42938 
+# 
+# Coefficients:
+#   Estimate Std. Error t value Pr(>|t|)    
+# (Intercept) 0.070658   0.069370   1.019   0.3087    
+# log(unempr) 0.088472   0.038594   2.292   0.0221 *  
+#   log(fedr)   0.072783   0.007459   9.757   <2e-16 ***
+#   ---
+#   Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+# 
+# Residual standard error: 0.2966 on 826 degrees of freedom
+# Multiple R-squared:  0.1034,	Adjusted R-squared:  0.1013 
+# F-statistic: 47.65 on 2 and 826 DF,  p-value: < 2.2e-16
+
+# Linear model 2 after solving for the negative NA values in log(fedr)
+model2 <- lm(inflr ~ logunempr + logfedr2, data = data3)
+summary(model2)
+plot(model2)
+
+# Coefficients and residuals
+model2_coefficients <- coef(model2)
+model2_residuals <- residuals(model2)
+
+# Set seed and number of simulations
+set.seed(1)
+n <- 1000
+simulated_inflr2 <- numeric(n)
+
+# Generating new simulated data
+simulated_logunempr <- rnorm(n, mean = mean(data3$logunempr), sd = sd(data3$logunempr))
+simulated_logfedr2 <- rnorm(n, mean = mean(data3$logfedr2), sd = sd(data3$logfedr2))
+
+# Performing Monte Carlo Simulations
+for (i in 1:n) {
+  random_residual <- sample(model2_residuals, 1)
+  simulated_inflr2[i] <- model2_coefficients[1] + 
+    model2_coefficients[2] * simulated_logunempr[i] + 
+    model2_coefficients[3] * simulated_logfedr2[i] +
+    random_residual
+}
+
+# Monte Carlo Simulation Results
+hist(simulated_inflr2, main = "Base Simulation of Inflation Rate", xlab = "Simulated Inflation Rate", breaks = 30)
+summary(simulated_inflr2)
+#   Min.   1st Qu.  Median   Mean   3rd Qu.   Max. 
+# -1.6441  0.1727  0.3145  0.3475  0.5021   1.8074
+
+# Monte Carlo confidence level for both tails at 10%, or 5% on each side
+mc_confidence_level2 <- 0.1
+
+# Monte Carlo VaR for both tails
+mc_lower_tail_VaR2 <- quantile(simulated_inflr2, mc_confidence_level2 / 2)
+print(mc_lower_tail_VaR2) # -0.0448235
+mc_upper_tail_VaR2 <- quantile(simulated_inflr2, 1 - mc_confidence_level2 / 2)
+print(mc_upper_tail_VaR2) # 0.9229492
+
+# Monte Carlo CVaR for both tails
+mc_lower_tail_CVaR2 <- mean(simulated_inflr2[simulated_inflr2 < mc_lower_tail_VaR2])
+print(mc_lower_tail_CVaR2) # -0.327501
+mc_upper_tail_CVaR2 <- mean(simulated_inflr2[simulated_inflr2 > mc_upper_tail_VaR2])
+print(mc_upper_tail_CVaR2) # 1.177565
